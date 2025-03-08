@@ -3,7 +3,7 @@ import os
 import json
 from datetime import datetime
 from dataclasses import dataclass, asdict
-from typing import Optional
+from typing import Optional, Dict, List, Any, Tuple
 
 from tqdm import tqdm
 from safetensors.torch import safe_open, save_file
@@ -16,12 +16,17 @@ import torch.multiprocessing as mp
 from torchvision.utils import save_image
 from torchvision.utils import save_image, make_grid
 from torch.utils.data import DataLoader
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 from torchastic import Compass, StochasticAccumulator
 import random
 
 from transformers import T5Tokenizer
 import wandb
+
+# Import the LatentCache from our new module
+from cache_utils import LatentCache
 
 from src.dataloaders.dataloader import TextImageDataset
 from src.models.chroma.model import Chroma, chroma_params
@@ -41,7 +46,6 @@ import src.lora_and_quant as lora_and_quant
 
 from huggingface_hub import HfApi, upload_file
 import time
-
 
 @dataclass
 class TrainingConfig:
@@ -423,7 +427,184 @@ def inference_wrapper(
     return output_image
 
 
-def train_chroma(rank, world_size, debug=False):
+# Function to precompute and cache all data
+def precompute_all_caches(dataset, dataloader, t5_tokenizer, t5, ae, model_config, 
+                          dataloader_config, training_config, rank, world_size,
+                          use_disk=True, cache_dir="cache"):
+    """
+    Precompute and cache all latents and text embeddings before training
+    Returns a dataset map with keys for each item
+    
+    Args:
+        use_disk: If True, store cache on disk instead of in memory
+        cache_dir: Base directory for cache storage
+    """
+    print(f"Rank {rank}: Pre-computing and caching all data...")
+    
+    # Create cache directories based on rank to avoid conflicts in distributed training
+    latent_cache_dir = f"{cache_dir}/latents_rank{rank}"
+    text_cache_dir = f"{cache_dir}/text_rank{rank}"
+    
+    print(f"Rank {rank}: Using {'disk' if use_disk else 'RAM'} for caching")
+    
+    # Create caches with specified storage type
+    latent_cache = LatentCache(use_disk=use_disk, cache_dir=latent_cache_dir, clear_existing=True)
+    text_cache = LatentCache(use_disk=use_disk, cache_dir=text_cache_dir, clear_existing=True)
+    
+    # Store dataset_map for quick retrieval during training
+    dataset_map = []
+    
+    # Load models to GPU once and keep them there during the entire caching process
+    print(f"Rank {rank}: Loading models to GPU for caching...")
+    t5_device_original = t5.device
+    ae_device_original = ae.device
+    
+    # Move models to GPU
+    t5 = t5.to(rank)
+    ae = ae.to(rank)
+    
+    try:
+        # Process all data in the dataloader
+        for data_idx, data in tqdm(
+            enumerate(dataloader),
+            total=len(dataset),
+            desc=f"Caching data, Rank {rank}",
+            position=rank,
+        ):
+            images, caption, index = data[0]
+            # Handle potential None captions
+            caption = [x if x is not None else "" for x in caption]
+            
+            for mb_i in tqdm(
+                range(
+                    dataloader_config.batch_size
+                    // training_config.cache_minibatch
+                    // world_size
+                ),
+                desc=f"Caching batch {data_idx}, Rank {rank}",
+                disable=data_idx > 0,  # Only show for first batch
+            ):
+                start_idx = mb_i * training_config.cache_minibatch
+                end_idx = start_idx + training_config.cache_minibatch
+                
+                # Get current batch data
+                current_captions = caption[start_idx:end_idx]
+                current_images = images[start_idx:end_idx]
+                
+                # Create batch mapping entry
+                batch_map = {
+                    "data_idx": data_idx,
+                    "mb_i": mb_i,
+                    "image_keys": [],
+                    "caption_keys": [],
+                }
+                
+                # Generate keys for captions
+                caption_keys = [
+                    f"{latent_cache.hash_content(caption_text)}_rank{rank}" 
+                    for caption_text in current_captions
+                ]
+                batch_map["caption_keys"] = caption_keys
+                
+                # Process and cache text embeddings
+                texts_to_process = []
+                text_indices = []
+                
+                for i, (caption_key, caption_text) in enumerate(zip(caption_keys, current_captions)):
+                    cached_result = text_cache.get(caption_key)
+                    if cached_result is None:
+                        texts_to_process.append(caption_text)
+                        text_indices.append(i)
+                
+                if texts_to_process:
+                    # Process text with t5 (already on GPU)
+                    text_inputs = t5_tokenizer(
+                        texts_to_process,
+                        padding="max_length",
+                        max_length=model_config.t5_max_length,
+                        truncation=True,
+                        return_length=False,
+                        return_overflowing_tokens=False,
+                        return_tensors="pt",
+                    ).to(t5.device)
+                    
+                    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        new_t5_embeds = t5(text_inputs.input_ids, text_inputs.attention_mask).to(
+                            "cpu", non_blocking=True
+                        )
+                        new_masks = text_inputs.attention_mask.to("cpu", non_blocking=True)
+                    
+                    # Store in cache
+                    for idx, orig_idx in enumerate(text_indices):
+                        embed = new_t5_embeds[idx:idx+1]  # Keep batch dimension
+                        mask = new_masks[idx:idx+1]  # Keep batch dimension
+                        text_cache.put(caption_keys[orig_idx], (embed, mask))
+                
+                # Generate keys for images and process
+                for i, img in enumerate(current_images):
+                    # Create content hash based on image
+                    if img.dim() >= 3:
+                        img_shape = "_".join(str(dim) for dim in img.shape)
+                        h, w = img.shape[-2], img.shape[-1]
+                        center_h, center_w = h // 2, w // 2
+                        patch_size = min(10, h // 2, w // 2)
+                        h_start, h_end = center_h - patch_size, center_h + patch_size
+                        w_start, w_end = center_w - patch_size, center_w + patch_size
+                        img_sample = img[:, h_start:h_end, w_start:w_end]
+                    else:
+                        img_shape = "_".join(str(dim) for dim in img.shape)
+                        img_sample = img
+                    
+                    # Create image key
+                    content_hash = latent_cache.hash_content(img_sample)
+                    img_key = f"img_{content_hash}_input_shape_{img_shape}_rank{rank}"
+                    batch_map["image_keys"].append(img_key)
+                    
+                    # Check cache
+                    if latent_cache.get(img_key) is None:
+                        # Cache miss - need to process this image (ae already on GPU)
+                        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            img_tensor = img.unsqueeze(0).to(rank)  # Add batch dimension
+                            latent = ae.encode_for_train(img_tensor).to("cpu", non_blocking=True)
+                        
+                        # Store in cache
+                        latent_cache.put(img_key, latent)
+                
+                # Add the batch mapping to our dataset map
+                dataset_map.append(batch_map)
+                
+                # Log cache stats occasionally
+                if (data_idx % 10 == 0 and mb_i == 0) or (data_idx == 0 and mb_i == 0):
+                    if rank == 0:  # Only log from main process
+                        print(f"Text cache stats: {text_cache.get_stats()}")
+                        print(f"Latent cache stats: {latent_cache.get_stats()}")
+                
+                # Clear CUDA cache periodically to prevent OOM
+                if mb_i % 10 == 0:
+                    torch.cuda.empty_cache()
+    
+    finally:
+        # Always move models back to their original devices when done
+        print(f"Rank {rank}: Moving models back to original devices...")
+        t5 = t5.to(t5_device_original)
+        ae = ae.to(ae_device_original)
+        torch.cuda.empty_cache()
+    
+    # Final stats
+    if rank == 0:
+        print(f"Final cache statistics:")
+        print(f"Text cache: {text_cache.get_stats()}")
+        print(f"Latent cache: {latent_cache.get_stats()}")
+    
+    return dataset_map, latent_cache, text_cache
+
+
+def train_chroma(rank, world_size, args=None, debug=False):
+    # Set default args if not provided
+    if args is None:
+        from types import SimpleNamespace
+        args = SimpleNamespace(ram_cache=False, cache_dir='cache', debug=debug)
+
     # Initialize distributed training
     if not debug:
         setup_distributed(rank, world_size)
@@ -514,34 +695,58 @@ def train_chroma(rank, world_size, debug=False):
         ratio_cutoff=dataloader_config.ratio_cutoff,
     )
 
+    # Create the dataloader ONCE, outside the epoch loop
+    dataloader = DataLoader(
+        dataset,
+        batch_size=1,  # batch size is handled in the dataset
+        shuffle=False,
+        num_workers=dataloader_config.num_workers,
+        prefetch_factor=dataloader_config.prefetch_factor,
+        pin_memory=True,
+        collate_fn=dataset.dummy_collate_fn,
+    )
+    
+    # PRE-COMPUTE ALL CACHES BEFORE TRAINING - ONCE FOR ALL EPOCHS
+    print(f"[Rank {rank}] Pre-computing all caches before training...")
+    
+    # Define cache directories based on command line args
+    cache_base_dir = args.cache_dir
+    
+    # Update precompute_all_caches function to accept use_disk parameter
+    dataset_map, latent_cache, text_cache = precompute_all_caches(
+        dataset, dataloader, t5_tokenizer, t5, ae, 
+        model_config, dataloader_config, training_config, rank, world_size,
+        use_disk=not args.ram_cache,
+        cache_dir=cache_base_dir
+    )
+    print(f"[Rank {rank}] Caching complete. Starting training loop...")
+    
+    if not debug:
+        dist.barrier()  # Ensure all nodes have completed caching
+
     optimizer = None
     scheduler = None
     hooks = []
     optimizer_counter = 0
+    epoch_counter = 0
+    
+    # Infinite training loop - keep the while True structure as requested
     while True:
+        epoch_counter += 1
         training_config.master_seed += 1
         torch.manual_seed(training_config.master_seed)
-        dataloader = DataLoader(
-            dataset,
-            batch_size=1,  # batch size is handled in the dataset
-            shuffle=False,
-            num_workers=dataloader_config.num_workers,
-            prefetch_factor=dataloader_config.prefetch_factor,
-            pin_memory=True,
-            collate_fn=dataset.dummy_collate_fn,
-        )
-        for counter, data in tqdm(
-            enumerate(dataloader),
-            total=len(dataset),
-            desc=f"training, Rank {rank}",
+        
+        print(f"[Rank {rank}] Starting epoch {epoch_counter}")
+
+        # TRAINING LOOP USING CACHED DATA
+        for counter, batch_map in tqdm(
+            enumerate(dataset_map),
+            total=len(dataset_map),
+            desc=f"Training epoch {epoch_counter}, Rank {rank}",
             position=rank,
         ):
-            images, caption, index = data[0]
-            # just in case the dataloader is failing
-            caption = [x if x is not None else "" for x in caption]
             if counter % training_config.change_layer_every == 0:
                 # periodically remove the optimizer and swap it with new one
-
                 # aliasing to make it cleaner
                 o_c = optimizer_counter
                 n_ls = training_config.trained_single_blocks
@@ -572,85 +777,39 @@ def train_chroma(rank, world_size, debug=False):
 
                 optimizer_counter += 1
 
-            # we load and unload vae and t5 here to reduce vram usage
-            # think of this as caching on the fly
-            # load t5 and vae to GPU
-            ae.to(rank)
-            t5.to(rank)
-
+            # Retrieve cached data for this batch
             acc_latents = []
             acc_embeddings = []
             acc_mask = []
-            for mb_i in tqdm(
-                range(
-                    dataloader_config.batch_size
-                    // training_config.cache_minibatch
-                    // world_size
-                ),
-                desc=f"preparing latents, Rank {rank}",
-                position=rank,
-            ):
-                with torch.no_grad(), torch.autocast(
-                    device_type="cuda", dtype=torch.bfloat16
-                ):
-                    # init random noise
-                    text_inputs = t5_tokenizer(
-                        caption[
-                            mb_i
-                            * training_config.cache_minibatch : mb_i
-                            * training_config.cache_minibatch
-                            + training_config.cache_minibatch
-                        ],
-                        padding="max_length",
-                        max_length=model_config.t5_max_length,
-                        truncation=True,
-                        return_length=False,
-                        return_overflowing_tokens=False,
-                        return_tensors="pt",
-                    ).to(t5.device)
-
-                    # offload to cpu
-                    t5_embed = t5(text_inputs.input_ids, text_inputs.attention_mask).to(
-                        "cpu", non_blocking=True
-                    )
-                    acc_embeddings.append(t5_embed)
-                    acc_mask.append(text_inputs.attention_mask)
-
-                    # flush
-                    torch.cuda.empty_cache()
-                    latents = ae.encode_for_train(
-                        images[
-                            mb_i
-                            * training_config.cache_minibatch : mb_i
-                            * training_config.cache_minibatch
-                            + training_config.cache_minibatch
-                        ].to(rank)
-                    ).to("cpu", non_blocking=True)
-                    acc_latents.append(latents)
-
-                    # flush
-                    torch.cuda.empty_cache()
-
-            # accumulate the latents and embedding in a variable
-            # unload t5 and vae
-
-            t5.to("cpu")
-            ae.to("cpu")
-            torch.cuda.empty_cache()
-            if not debug:
-                dist.barrier()
-
-            # move model to device
-            model.to(rank)
-
+            
+            for img_key, caption_key in zip(batch_map["image_keys"], batch_map["caption_keys"]):
+                # Get image latent from cache
+                latent = latent_cache.get(img_key)
+                if latent is not None:
+                    acc_latents.append(latent)
+                
+                # Get text embedding from cache
+                text_data = text_cache.get(caption_key)
+                if text_data is not None:
+                    embed, mask = text_data
+                    acc_embeddings.append(embed)
+                    acc_mask.append(mask)
+            
+            # Only proceed if we have all data
+            if not acc_latents or not acc_embeddings:
+                print(f"Warning: Missing cached data for batch {counter}")
+                continue
+                
+            # Concatenate batch data
             acc_latents = torch.cat(acc_latents, dim=0)
             acc_embeddings = torch.cat(acc_embeddings, dim=0)
             acc_mask = torch.cat(acc_mask, dim=0)
-
-            # process the cache buffer now!
-            with torch.no_grad(), torch.autocast(
-                device_type="cuda", dtype=torch.bfloat16
-            ):
+            
+            # Move model to device
+            model.to(rank)
+            
+            # Prepare for training
+            with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 # prepare flat image and the target lerp
                 (
                     noisy_latents,
@@ -669,25 +828,22 @@ def train_chroma(rank, world_size, debug=False):
                 # NOTE:
                 # using static guidance 1 for now
                 # this should be disabled later on !
-                static_guidance = torch.tensor(
-                    [0.0] * acc_latents.shape[0], device=rank
-                )
+                static_guidance = torch.tensor([0.0] * acc_latents.shape[0], device=rank)
 
-            # set the input to requires grad to make autograd works
+            # Set inputs to requires_grad for backprop
             noisy_latents.requires_grad_(True)
             acc_embeddings.requires_grad_(True)
 
-            ot_bs = acc_latents.shape[0]
-
-            # aliasing
+            # Process in mini-batches for better memory efficiency
             mb = training_config.train_minibatch
             loss_log = []
+            
             for tmb_i in tqdm(
                 range(dataloader_config.batch_size // mb // world_size),
                 desc=f"minibatch training, Rank {rank}",
                 position=rank,
             ):
-                # do this inside for loops!
+                # Process each mini-batch separately
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     pred = model(
                         img=noisy_latents[tmb_i * mb : tmb_i * mb + mb].to(
@@ -712,7 +868,8 @@ def train_chroma(rank, world_size, debug=False):
                             rank, non_blocking=True
                         ),
                     )
-                    # TODO: need to scale the loss with rank count and grad accum!
+                    
+                    # Calculate loss for this mini-batch
                     loss = (
                         F.mse_loss(
                             pred,
@@ -720,38 +877,44 @@ def train_chroma(rank, world_size, debug=False):
                         )
                         / dataloader_config.batch_size
                     )
+                
+                # Backward pass for this mini-batch
                 torch.cuda.empty_cache()
                 loss.backward()
                 loss_log.append(loss.detach().clone() * dataloader_config.batch_size)
+            
+            # Calculate average loss across all mini-batches
             loss_log = sum(loss_log) / len(loss_log)
-            # offload some params to cpu just enough to make room for the caching process
-            # and only offload non trainable params
+            
+            # Free memory
             del acc_embeddings, noisy_latents, acc_latents
             torch.cuda.empty_cache()
+            
+            # Offload non-trainable params to save memory
             offload_param_count = 0
             for name, param in model.named_parameters():
                 if not any(keyword in name for keyword in trained_layer_keywords):
                     if offload_param_count < training_config.offload_param_count:
                         offload_param_count += param.numel()
                         param.data = param.data.to("cpu", non_blocking=True)
+                        
             optimizer_state_to(optimizer, rank)
-
             StochasticAccumulator.reassign_grad_buffer(model)
 
             if not debug:
                 synchronize_gradients(model)
 
             scheduler.step()
-
             optimizer.step()
             optimizer.zero_grad()
 
             if training_config.wandb_project is not None and rank == 0:
-                wandb.log({"loss": loss_log, "lr": training_config.lr})
+                wandb.log({"loss": loss_log, "lr": training_config.lr, "epoch": epoch_counter})
 
             optimizer_state_to(optimizer, "cpu")
             torch.cuda.empty_cache()
 
+            # Save model periodically
             if (counter + 1) % training_config.save_every == 0 and rank == 0:
                 model_filename = f"{training_config.save_folder}/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.pth"
                 torch.save(
@@ -765,13 +928,25 @@ def train_chroma(rank, world_size, debug=False):
                         training_config.hf_repo_id,
                         training_config.hf_token,
                     )
+                    
             if not debug:
                 dist.barrier()
 
+            # Run inference periodically
             if (counter + 1) % inference_config.inference_every == 0:
+                # Inference code goes here, unchanged from original
                 all_grids = []
 
-                preview_prompts = inference_config.prompts + caption[:1]
+                # Get the data for the current batch to use in inference
+                data_idx = batch_map["data_idx"]
+                mb_i = batch_map["mb_i"]
+                
+                # Collect actual captions from the dataloader for the current batch
+                batch_data = dataset[data_idx * world_size + rank]
+                images, captions, _ = batch_data
+                current_captions = captions[mb_i * training_config.cache_minibatch:][:1]
+                
+                preview_prompts = inference_config.prompts + current_captions
 
                 for prompt in preview_prompts:
                     images_tensor = inference_wrapper(
@@ -885,7 +1060,7 @@ def train_chroma(rank, world_size, debug=False):
 
                     # Save the combined grid
                     file_path = os.path.join(
-                        inference_config.inference_folder, f"{counter}.jpg"
+                        inference_config.inference_folder, f"epoch{epoch_counter}_batch{counter}.jpg"
                     )
                     save_image(final_grid, file_path)
                     print(f"Combined image grid saved to {file_path}")
@@ -901,13 +1076,10 @@ def train_chroma(rank, world_size, debug=False):
                             }
                         )
 
-            # flush
-            acc_latents = []
-            acc_embeddings = []
-
-        # save final model
+        # Save epoch checkpoint
         if rank == 0:
-            model_filename = f"{training_config.save_folder}/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.pth"
+            print(f"Completed epoch {epoch_counter}")
+            model_filename = f"{training_config.save_folder}/epoch_{epoch_counter}.pth"
             torch.save(
                 model.state_dict(),
                 model_filename,
@@ -915,7 +1087,7 @@ def train_chroma(rank, world_size, debug=False):
             if training_config.hf_token:
                 upload_to_hf(
                     model_filename,
-                    model_filename,
+                    f"epoch_{epoch_counter}.pth",
                     training_config.hf_repo_id,
                     training_config.hf_token,
                 )
